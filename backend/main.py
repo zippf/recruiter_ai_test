@@ -1203,15 +1203,27 @@ async def get_clients(
     admin_db = get_admin_supabase_client()
     recruiter_owner_ids, user_org_id = get_recruiter_owner_ids(authorization, x_user_email)
     
-    if recruiter_owner_ids:
+    if recruiter_owner_ids or user_org_id:
         valid_uuids = filter_valid_uuids(recruiter_owner_ids)
-        client_ids = set()
-        if valid_uuids:
-            user_reqs = admin_db.table("requirements").select("client_id").in_("created_by", valid_uuids).eq("is_deleted", False).execute().data or []
-            client_ids = set(r["client_id"] for r in user_reqs if r.get("client_id"))
+        all_reqs = admin_db.table("requirements").select("client_id, organization_id, created_by").eq("is_deleted", False).execute().data or []
         
+        client_ids = set()
+        for r in all_reqs:
+            if user_org_id and r.get("organization_id") == user_org_id:
+                if r.get("client_id"): client_ids.add(r["client_id"])
+            elif r.get("created_by") and (r.get("created_by") in recruiter_owner_ids or r.get("created_by") in valid_uuids):
+                if r.get("client_id"): client_ids.add(r["client_id"])
+            elif not r.get("organization_id") and not r.get("created_by"):
+                if r.get("client_id"): client_ids.add(r["client_id"])
+
         all_cls = admin_db.table("clients").select("*").eq("is_deleted", False).execute().data or []
-        return [c for c in all_cls if c["id"] in client_ids or c.get("created_by") in recruiter_owner_ids]
+        return [
+            c for c in all_cls
+            if c["id"] in client_ids 
+            or (user_org_id and c.get("organization_id") == user_org_id)
+            or (c.get("created_by") and c.get("created_by") in recruiter_owner_ids)
+            or (not c.get("organization_id") and not c.get("created_by"))
+        ]
     return []
 
 @app.post("/api/v1/clients")
@@ -2071,11 +2083,19 @@ async def get_requirements(
     admin_db = get_admin_supabase_client()
     recruiter_owner_ids, user_org_id = get_recruiter_owner_ids(authorization, x_user_email)
     
-    if recruiter_owner_ids:
+    if recruiter_owner_ids or user_org_id:
         valid_uuids = filter_valid_uuids(recruiter_owner_ids)
-        if valid_uuids:
-            res = admin_db.table("requirements").select("*").in_("created_by", valid_uuids).eq("is_deleted", False).execute()
-            return res.data or []
+        all_reqs = admin_db.table("requirements").select("*").eq("is_deleted", False).execute().data or []
+        
+        filtered = []
+        for r in all_reqs:
+            if user_org_id and r.get("organization_id") == user_org_id:
+                filtered.append(r)
+            elif r.get("created_by") and (r.get("created_by") in recruiter_owner_ids or r.get("created_by") in valid_uuids):
+                filtered.append(r)
+            elif not r.get("organization_id") and not r.get("created_by"):
+                filtered.append(r)
+        return filtered
     return []
 
 @app.put("/api/v1/requirements/{req_id}")
@@ -2580,11 +2600,19 @@ async def get_jobs(
     admin_db = get_admin_supabase_client()
     recruiter_owner_ids, user_org_id = get_recruiter_owner_ids(authorization, x_user_email)
     
-    if recruiter_owner_ids:
+    if recruiter_owner_ids or user_org_id:
         valid_uuids = filter_valid_uuids(recruiter_owner_ids)
+        all_reqs = admin_db.table("requirements").select("id, title, client_id, num_posts_requested, created_by, organization_id").eq("is_deleted", False).execute().data or []
+        
         user_reqs = []
-        if valid_uuids:
-            user_reqs = admin_db.table("requirements").select("id, title, client_id").in_("created_by", valid_uuids).eq("is_deleted", False).execute().data or []
+        for r in all_reqs:
+            if user_org_id and r.get("organization_id") == user_org_id:
+                user_reqs.append(r)
+            elif r.get("created_by") and (r.get("created_by") in recruiter_owner_ids or r.get("created_by") in valid_uuids):
+                user_reqs.append(r)
+            elif not r.get("organization_id") and not r.get("created_by"):
+                user_reqs.append(r)
+
         req_map = {r["id"]: r for r in user_reqs}
         req_ids = list(req_map.keys())
         
@@ -2592,7 +2620,7 @@ async def get_jobs(
             client_ids = [r["client_id"] for r in user_reqs if r.get("client_id")]
             client_map = {}
             if client_ids:
-                cli_data = admin_db.table("clients").select("id, name").in_("id", client_ids).execute().data or []
+                cli_data = admin_db.table("clients").select("id, name").in_("id", list(set(client_ids))).execute().data or []
                 client_map = {c["id"]: c.get("name") for c in cli_data}
                 
             jobs_data = admin_db.table("job_openings").select("*").in_("requirement_id", req_ids).eq("is_deleted", False).execute().data or []
@@ -2603,7 +2631,9 @@ async def get_jobs(
                 formatted.append(enrich_job_with_form_config({
                     **row,
                     "requirement_title": req.get("title") or "General Requirement",
-                    "client_name": cli_name
+                    "client_name": cli_name,
+                    "client_id": row.get("client_id") or req.get("client_id"),
+                    "num_posts_requested": req.get("num_posts_requested") or 1
                 }))
             return formatted
     return []
