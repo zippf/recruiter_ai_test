@@ -51,6 +51,8 @@ BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:8000").rstrip
 PUBLIC_BACKEND_URL = (os.getenv("SERVICE_URL_BACKEND") or os.getenv("PUBLIC_BACKEND_URL") or BACKEND_BASE_URL).rstrip("/")
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
 MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "30.0"))
+N8N_MATCH_TIMEOUT_SECONDS = int(os.getenv("N8N_MATCH_TIMEOUT_SECONDS", "300"))
+
 
 LINKEDIN_CLIENT_ID = os.getenv("LINKEDIN_CLIENT_ID")
 LINKEDIN_CLIENT_SECRET = os.getenv("LINKEDIN_CLIENT_SECRET")
@@ -865,6 +867,11 @@ class CandidateMatchItem(BaseModel):
 class CandidateMatchesCallback(BaseModel):
     job_opening_id: str
     matches: List[CandidateMatchItem]
+    match_threshold: Optional[float] = None
+    total_candidates_processed: Optional[int] = None
+    shortlisted_count: Optional[int] = None
+    rejected_candidates_count: Optional[int] = None
+
 
 class GeneratedQuestion(BaseModel):
     question: str
@@ -1465,20 +1472,25 @@ async def handle_scan_publish_dispatch(job: dict, jwt_token: str):
         logger.warning("n8n dispatch failed for extract_skills, falling back to local execution")
         run_local_scan_publish(job["id"], jwt_token)
 
-async def auto_complete_matching_safety(job_id: str, delay_seconds: int = 20):
+async def n8n_matching_timeout_safety(job_id: str, timeout_seconds: int = 300):
     """
-    Safety net to ensure processing_status on job_openings is reset to 'ready'
-    even if n8n callback fails or is blocked by network/CORS/localhost issues.
+    Safety net to mark processing_status as 'failed' if n8n callback does not complete within timeout.
+    Prevents lingering 'matching' status while ensuring callback remains authoritative.
     """
-    await asyncio.sleep(delay_seconds)
+    await asyncio.sleep(timeout_seconds)
     try:
         db = get_admin_supabase_client()
         job_res = db.table("job_openings").select("processing_status").eq("id", job_id).execute()
         if job_res.data and job_res.data[0].get("processing_status") == "matching":
-            logger.info(f"Auto-completing matching status for job {job_id} after {delay_seconds}s safety window.")
-            db.table("job_openings").update({"processing_status": "ready"}).eq("id", job_id).execute()
+            logger.warning(f"[MATCH_TIMEOUT] Matching for job {job_id} timed out after {timeout_seconds}s. Transitioning status to 'failed'.")
+            db.table("job_openings").update({
+                "processing_status": "failed",
+                "error_message": f"n8n candidate matching timed out after {timeout_seconds} seconds."
+            }).eq("id", job_id).execute()
+        else:
+            logger.info(f"[MATCH_TIMEOUT_CHECK] Job {job_id} already transitioned out of 'matching' status. No timeout action required.")
     except Exception as e:
-        logger.error(f"Error in auto_complete_matching_safety for job {job_id}: {e}")
+        logger.error(f"Error in n8n_matching_timeout_safety for job {job_id}: {e}")
 
 async def handle_match_candidates_dispatch(job_id: str, jwt_token: str, matching_scope: str = "both"):
     db = get_safe_supabase_client(SUPABASE_URL, SUPABASE_KEY, jwt_token)
@@ -1560,15 +1572,24 @@ async def handle_match_candidates_dispatch(job_id: str, jwt_token: str, matching
             "auth_header": f"Bearer {CALLBACK_SECRET}"
         }
         
+        logger.info(f"[MATCH_START] Initiating n8n candidate matching for job {job_id}. Candidates: {len(candidates)}, threshold: {MATCH_THRESHOLD}")
         success = await dispatch_n8n_webhook(N8N_MATCH_CANDIDATES_URL, payload, "match_candidates")
         if success:
-            asyncio.create_task(auto_complete_matching_safety(job_id, delay_seconds=20))
+            logger.info(f"[MATCH_DISPATCHED] Successfully dispatched n8n matching for job {job_id}. Timeout guard scheduled in {N8N_MATCH_TIMEOUT_SECONDS}s.")
+            asyncio.create_task(n8n_matching_timeout_safety(job_id, timeout_seconds=N8N_MATCH_TIMEOUT_SECONDS))
         else:
-            logger.warning("n8n dispatch failed for match_candidates, falling back to local execution")
-            match_candidates_background(job_id, jwt_token, matching_scope)
+            logger.error(f"[MATCH_DISPATCH_FAILED] n8n dispatch returned failure for job {job_id}.")
+            admin_db.table("job_openings").update({
+                "processing_status": "failed",
+                "error_message": "n8n candidate matching dispatch failed"
+            }).eq("id", job_id).execute()
     except Exception as e:
-        logger.error(f"Error in handle_match_candidates_dispatch: {e}")
-        match_candidates_background(job_id, jwt_token, matching_scope)
+        logger.error(f"[MATCH_DISPATCH_ERROR] Exception in handle_match_candidates_dispatch for job {job_id}: {e}")
+        admin_db.table("job_openings").update({
+            "processing_status": "failed",
+            "error_message": f"n8n candidate matching error: {str(e)}"
+        }).eq("id", job_id).execute()
+
 
 def send_whatsapp_notification_sync(phone: str, message: str, candidate_name: str, job_title: str, event_type: str):
     # Clean phone number (keep only digits)
@@ -3990,7 +4011,8 @@ async def delete_candidate(candidate_id: str, db: Client = Depends(get_supabase)
 
 @app.get("/api/v1/candidates/{candidate_id}/applications")
 async def get_candidate_applications(candidate_id: str, db: Client = Depends(get_supabase)):
-    res = db.table("applications").select("*, job_openings(*, requirements(*, clients(name)))").eq("candidate_id", candidate_id).execute()
+    admin_db = get_admin_supabase_client()
+    res = admin_db.table("applications").select("*, job_openings(*, requirements(*, clients(name)))").eq("candidate_id", candidate_id).execute()
     formatted = []
     for row in res.data:
         job = row.get("job_openings") or {}
@@ -3998,20 +4020,21 @@ async def get_candidate_applications(candidate_id: str, db: Client = Depends(get
         cli = req.get("clients") or {}
         formatted.append({
             **{k: v for k, v in row.items() if k != "job_openings"},
-            "job_title": job.get("title", "Unknown Job"),
-            "client_name": cli.get("name", "Generic Client")
+            "job_title": job.get("title") or req.get("title") or "Unknown Job",
+            "client_name": cli.get("name") or "Generic Client"
         })
     return formatted
 
 @app.get("/api/v1/candidates/{candidate_id}/history")
 async def get_candidate_history(candidate_id: str, db: Client = Depends(get_supabase)):
-    apps_res = db.table("applications").select("*, job_openings(*, requirements(*, clients(name)))").eq("candidate_id", candidate_id).execute()
+    admin_db = get_admin_supabase_client()
+    apps_res = admin_db.table("applications").select("*, job_openings(*, requirements(*, clients(name)))").eq("candidate_id", candidate_id).execute()
     apps = apps_res.data or []
     
     app_ids = [a["id"] for a in apps]
     stages = []
     if app_ids:
-        stages_res = db.table("interview_stages").select("*").in_("application_id", app_ids).execute()
+        stages_res = admin_db.table("interview_stages").select("*").in_("application_id", app_ids).execute()
         stages = stages_res.data or []
         
     formatted = []
@@ -4027,8 +4050,8 @@ async def get_candidate_history(candidate_id: str, db: Client = Depends(get_supa
         formatted.append({
             "application_id": app_row["id"],
             "job_id": job.get("id"),
-            "job_title": job.get("title", "Unknown Job"),
-            "client_name": cli.get("name", "Generic Client"),
+            "job_title": job.get("title") or req.get("title") or "Unknown Job",
+            "client_name": cli.get("name") or "Generic Client",
             "fuzzy_score": app_row.get("fuzzy_score"),
             "match_score": app_row.get("match_score"),
             "match_reason": app_row.get("match_reason"),
@@ -5597,90 +5620,125 @@ async def callback_regenerate_job(payload: JobRegenerateCallback):
 
 @app.post("/api/v1/callbacks/candidate-matches", dependencies=[Depends(verify_callback_secret)])
 async def callback_candidate_matches(payload: CandidateMatchesCallback):
-    logger.info(f"Received candidate matches callback for job {payload.job_opening_id}")
+    logger.info(f"[MATCH_CALLBACK_RECEIVED] Received candidate matches callback for job {payload.job_opening_id}. Matches count: {len(payload.matches)}")
     db = get_admin_supabase_client()
     
-    # Clear existing job candidates
-    db.table("job_candidates").delete().eq("job_opening_id", payload.job_opening_id).execute()
-    
-    # Fetch candidates' parsed_resume_json and filter by job_id or linked applications
-    cand_ids = [match.candidate_id for match in payload.matches]
-    valid_cand_ids = set()
-    cand_resumes = {}
-    if cand_ids:
-        # Get candidate IDs that are already linked to this job via applications
-        linked_apps_res = db.table("applications").select("candidate_id").eq("job_opening_id", payload.job_opening_id).execute()
-        linked_cand_ids = set(a["candidate_id"] for a in linked_apps_res.data or [])
+    # 1. Validate job opening exists
+    job_res = db.table("job_openings").select("id, title, requirement_id").eq("id", payload.job_opening_id).execute()
+    if not job_res.data:
+        logger.error(f"[MATCH_CALLBACK_ERROR] Job opening {payload.job_opening_id} not found in database.")
+        raise HTTPException(status_code=404, detail="Job opening not found")
         
-        cands_res = db.table("candidates").select("id, job_id, parsed_resume_json").in_("id", cand_ids).eq("is_deleted", False).execute()
+    job_title = job_res.data[0].get("title", "Unknown Job")
+    
+    # Effective threshold: use payload threshold if specified, else default MATCH_THRESHOLD
+    effective_threshold = payload.match_threshold if payload.match_threshold is not None else MATCH_THRESHOLD
+    
+    # 2. Filter matches that meet effective threshold
+    valid_incoming_matches = [m for m in payload.matches if m.fuzzy_score >= effective_threshold]
+    cand_ids = [m.candidate_id for m in valid_incoming_matches]
+    
+    # 3. Batch query valid candidates
+    cand_records = {}
+    if cand_ids:
+        cands_res = db.table("candidates").select("id, full_name, parsed_resume_json").in_("id", cand_ids).eq("is_deleted", False).execute()
         if cands_res.data:
-            for c in cands_res.data:
-                if c.get("job_id") == payload.job_opening_id or c["id"] in linked_cand_ids:
-                    valid_cand_ids.add(c["id"])
-                    cand_resumes[c["id"]] = c.get("parsed_resume_json")
+            cand_records = {c["id"]: c for c in cands_res.data}
+
+    # 4. Batch query existing applications for (job_opening_id, candidate_id)
+    existing_apps = {}
+    if cand_records:
+        apps_res = db.table("applications").select("id, candidate_id").eq("job_opening_id", payload.job_opening_id).in_("candidate_id", list(cand_records.keys())).execute()
+        if apps_res.data:
+            existing_apps = {a["candidate_id"]: a["id"] for a in apps_res.data}
             
     seen_candidate_ids = set()
     scored_candidates = []
-    for idx, match in enumerate(payload.matches):
-        if match.candidate_id not in valid_cand_ids:
+    
+    for match in valid_incoming_matches:
+        cand_id = match.candidate_id
+        if cand_id not in cand_records or cand_id in seen_candidate_ids:
             continue
-        if match.candidate_id in seen_candidate_ids:
-            continue
-        seen_candidate_ids.add(match.candidate_id)
+        seen_candidate_ids.add(cand_id)
         
-        # Query existing application
-        app_res = (
-            db.table("applications")
-              .select("id")
-              .eq("candidate_id", match.candidate_id)
-              .eq("job_opening_id", payload.job_opening_id)
-              .limit(1)
-              .execute()
-        )
+        match_reason = match.reasoning or f"AI matched candidate with score {match.fuzzy_score}"
+        strengths_list = match.strengths[:3] if isinstance(match.strengths, list) else []
+        gaps_list = match.skill_gaps[:3] if isinstance(match.skill_gaps, list) else []
         
-        if app_res.data and match.fuzzy_score >= MATCH_THRESHOLD:
+        # Determine application record (reuse existing or auto-create/upsert)
+        app_id = existing_apps.get(cand_id)
+        if app_id:
+            # Update existing application with exact n8n scores
+            db.table("applications").update({
+                "fuzzy_score": match.fuzzy_score,
+                "match_score": int(match.fuzzy_score),
+                "match_reason": match_reason,
+                "strengths": strengths_list,
+                "skill_gaps": gaps_list
+            }).eq("id", app_id).execute()
+        else:
+            # Create new application record for shortlisted pool candidate
+            app_res = db.table("applications").upsert({
+                "candidate_id": cand_id,
+                "job_opening_id": payload.job_opening_id,
+                "fuzzy_score": match.fuzzy_score,
+                "match_score": int(match.fuzzy_score),
+                "match_reason": match_reason,
+                "strengths": strengths_list,
+                "skill_gaps": gaps_list,
+                "screening_status": "pending",
+                "stage": "screening",
+                "stage_status": "pending"
+            }, on_conflict="candidate_id,job_opening_id").execute()
+            
+            if app_res.data:
+                app_id = app_res.data[0]["id"]
+                existing_apps[cand_id] = app_id
+                
+        if app_id:
             scored_candidates.append({
                 "job_opening_id": payload.job_opening_id,
-                "candidate_id": match.candidate_id,
-                "application_id": app_res.data[0]["id"],
+                "candidate_id": cand_id,
+                "application_id": app_id,
                 "fuzzy_score": match.fuzzy_score,
-                "rank_order": 1, # updated later
-                "strengths": match.strengths[:3],
-                "skill_gaps": match.skill_gaps[:3],
-                "parsed_resume": cand_resumes.get(match.candidate_id)
+                "rank_order": 1, # updated next
+                "strengths": strengths_list,
+                "skill_gaps": gaps_list,
+                "parsed_resume": cand_records[cand_id].get("parsed_resume_json")
             })
             
-    # Sort and rank
-    scored_candidates.sort(key=lambda x: x["fuzzy_score"], reverse=True)
+    # 5. Sort shortlisted candidates by fuzzy_score DESC (with candidate_id for deterministic tie-breaking)
+    scored_candidates.sort(key=lambda x: (x["fuzzy_score"], x["candidate_id"]), reverse=True)
+    
+    # 6. Atomic replacement of job_candidates for this job_opening_id
+    db.table("job_candidates").delete().eq("job_opening_id", payload.job_opening_id).execute()
     for rank, item in enumerate(scored_candidates, 1):
         item["rank_order"] = rank
         db.table("job_candidates").insert(item).execute()
         
-    # Set job status/processing_status
+    # 7. Update job status to ready
     db.table("job_openings").update({"processing_status": "ready"}).eq("id", payload.job_opening_id).execute()
+    logger.info(f"[MATCH_PERSISTED] Successfully persisted {len(scored_candidates)} shortlisted n8n candidate matches for job {payload.job_opening_id}. Status set to 'ready'.")
     
-    # Send notification and log activity
+    # 8. Send notification and log activity
     recruiter_id = None
-    job_title = "Unknown Job"
     try:
-        job_res = db.table("job_openings").select("title, requirement_id").eq("id", payload.job_opening_id).execute()
-        if job_res.data:
-            job_title = job_res.data[0].get("title", "")
-            req_id = job_res.data[0].get("requirement_id")
+        req_id = job_res.data[0].get("requirement_id")
+        if req_id:
             req_res = db.table("requirements").select("created_by").eq("id", req_id).execute()
             if req_res.data:
                 recruiter_id = req_res.data[0].get("created_by")
     except Exception as e:
-        logger.error(f"Failed to resolve recruiter_id/job_title in callback_candidate_matches: {e}")
+        logger.error(f"Failed to resolve recruiter_id in callback_candidate_matches: {e}")
         
     if recruiter_id:
         create_system_notification(
             db,
             recruiter_id,
             "Candidate Matching Completed",
-            f"Candidate matching completed for job '{job_title}'. Found {len(payload.matches)} matches.",
+            f"Candidate matching completed for job '{job_title}'. Found {len(scored_candidates)} matches.",
             "candidate_matching",
-            {"job_opening_id": payload.job_opening_id, "job_title": job_title, "matches_count": len(payload.matches)}
+            {"job_opening_id": payload.job_opening_id, "job_title": job_title, "matches_count": len(scored_candidates)}
         )
         log_activity_event(
             db,
@@ -5689,9 +5747,26 @@ async def callback_candidate_matches(payload: CandidateMatchesCallback):
             entity_id=payload.job_opening_id,
             actor_name="System",
             actor_id=recruiter_id,
-            metadata={"job_title": job_title, "matches_count": len(payload.matches)}
+            metadata={"job_title": job_title, "matches_count": len(scored_candidates)}
         )
-    return {"status": "success"}
+        
+    return {
+        "status": "success",
+        "processing_status": "ready",
+        "job_opening_id": payload.job_opening_id,
+        "total_candidates_processed": payload.total_candidates_processed or len(payload.matches),
+        "shortlisted_count": len(scored_candidates),
+        "rejected_candidates_count": (payload.total_candidates_processed or len(payload.matches)) - len(scored_candidates),
+        "match_threshold": effective_threshold,
+        "matches": [
+            {
+                "candidate_id": item["candidate_id"],
+                "fuzzy_score": item["fuzzy_score"],
+                "rank_order": item["rank_order"]
+            } for item in scored_candidates
+        ]
+    }
+
 
 @app.post("/api/v1/callbacks/screening-questions", dependencies=[Depends(verify_callback_secret)])
 async def callback_screening_questions(payload: ScreeningQuestionsCallback):
