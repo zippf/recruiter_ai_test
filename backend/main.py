@@ -1,5 +1,6 @@
 import os
 import asyncio
+from datetime import datetime, timezone
 import io
 import json
 import logging
@@ -30,8 +31,34 @@ if os.path.exists(env_file_root):
     load_dotenv(dotenv_path=env_file_root, override=True)
 load_dotenv(override=True)
 
-logging.basicConfig(level=logging.INFO)
+from contextvars import ContextVar
+
+# Context variables for tracking requests & users across execution context
+correlation_id_ctx: ContextVar[str] = ContextVar("correlation_id", default="")
+user_email_ctx: ContextVar[str] = ContextVar("user_email", default="anonymous")
+
+# Structured JSON Log Formatter
+class JSONLogFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        log_object = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "correlation_id": correlation_id_ctx.get(),
+            "user_email": user_email_ctx.get(),
+            "message": record.getMessage()
+        }
+        if record.exc_info:
+            log_object["exception"] = self.formatException(record.exc_info)
+        return json.dumps(log_object)
+
 logger = logging.getLogger("backend")
+logger.setLevel(logging.INFO)
+for h in logger.handlers[:]:
+    logger.removeHandler(h)
+handler = logging.StreamHandler()
+handler.setFormatter(JSONLogFormatter())
+logger.addHandler(handler)
 
 # Read config
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -66,6 +93,50 @@ password_otps: Dict[str, Dict[str, Any]] = {}
 
 # Initialize FastAPI
 app = FastAPI(title="Kozker Recruiter AI Backend", version="1.0.0")
+
+# Noise filter for non-essential HTTP paths
+NOISY_PATHS = {"/docs", "/redoc", "/openapi.json", "/favicon.ico", "/health", "/metrics"}
+
+# Correlation ID & Observability Middleware
+@app.middleware("http")
+async def correlation_id_middleware(request: Request, call_next):
+    corr_id = request.headers.get("x-correlation-id") or request.headers.get("x-request-id") or f"corr_{uuid.uuid4().hex[:12]}"
+    user_email = request.headers.get("x-user-email") or "anonymous"
+
+    token_corr = correlation_id_ctx.set(corr_id)
+    token_user = user_email_ctx.set(user_email)
+
+    start_time = time.time()
+    try:
+        response = await call_next(request)
+        duration_ms = round((time.time() - start_time) * 1000, 2)
+        
+        # Suppress log noise for OPTIONS preflight, docs, and health checks
+        is_noisy = request.method == "OPTIONS" or request.url.path in NOISY_PATHS
+        if not is_noisy:
+            logger.info(json.dumps({
+                "event": "http_request_complete",
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+                "duration_ms": duration_ms
+            }))
+        
+        response.headers["X-Correlation-ID"] = corr_id
+        return response
+    except Exception as exc:
+        duration_ms = round((time.time() - start_time) * 1000, 2)
+        logger.error(json.dumps({
+            "event": "http_request_error",
+            "method": request.method,
+            "path": request.url.path,
+            "duration_ms": duration_ms,
+            "error_detail": str(exc)
+        }), exc_info=True)
+        raise exc
+    finally:
+        correlation_id_ctx.reset(token_corr)
+        user_email_ctx.reset(token_user)
 
 # CORS setup
 app.add_middleware(
@@ -164,7 +235,27 @@ def get_safe_supabase_client(url: str, key: str, jwt_token: str = None) -> Clien
 def get_admin_supabase_client() -> Client:
     # Bypasses RLS for system/callback tasks
     key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY
+    if not key:
+        raise HTTPException(status_code=500, detail="Supabase key not configured on server")
     return get_safe_supabase_client(SUPABASE_URL, key)
+
+class TelemetryEventModel(BaseModel):
+    event_name: str
+    timestamp: Optional[str] = None
+    url: Optional[str] = None
+    metadata: Optional[dict] = None
+    correlation_id: Optional[str] = None
+
+@app.post("/api/v1/telemetry/event")
+async def ingest_telemetry_event(event: TelemetryEventModel, request: Request):
+    logger.info(json.dumps({
+        "event": "frontend_telemetry",
+        "telemetry_event_name": event.event_name,
+        "page_url": event.url,
+        "client_metadata": event.metadata,
+        "client_correlation_id": event.correlation_id or correlation_id_ctx.get()
+    }))
+    return {"status": "recorded"}
 
 # Helper: Get Supabase client authenticated as the user
 def get_supabase(authorization: Optional[str] = Header(None)) -> Client:
@@ -174,12 +265,32 @@ def get_supabase(authorization: Optional[str] = Header(None)) -> Client:
             jwt_token = authorization.split(" ")[1]
         elif authorization.startswith("eyJ"):
             jwt_token = authorization
-    key = SUPABASE_KEY
+    key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY
     return get_safe_supabase_client(SUPABASE_URL, key, jwt_token)
 
-# Helper: Extract current user ID from Authorization header Bearer token
-def get_current_user_id(authorization: Optional[str] = Header(None)) -> Optional[str]:
-    """Extracts the Supabase auth UUID (sub) from the JWT Bearer token."""
+# Helper: Extract current user ID from Authorization header Bearer token or X-User-Email
+def get_current_user_id(
+    authorization: Optional[str] = Header(None),
+    x_user_email: Optional[str] = Header(None, alias="x-user-email")
+) -> Optional[str]:
+    # 1. Try X-User-Email header first
+    if x_user_email:
+        clean_email = x_user_email.strip().lower()
+        try:
+            db = get_admin_supabase_client()
+            # Check profiles table first (recruiter_id in clients, requirements, candidates)
+            p_res = db.table("profiles").select("id").ilike("email", clean_email).execute()
+            if p_res.data and len(p_res.data) > 0:
+                return p_res.data[0]["id"]
+            res = db.table("members").select("id").ilike("email", clean_email).execute()
+            if res.data and len(res.data) > 0:
+                return res.data[0]["id"]
+            return f"user_{clean_email}"
+        except Exception as e:
+            logger.error(f"Failed to resolve member by X-User-Email: {e}")
+            return f"user_{clean_email}"
+
+    # 2. Try Authorization header
     if authorization:
         token = None
         if authorization.startswith("Bearer "):
@@ -188,14 +299,40 @@ def get_current_user_id(authorization: Optional[str] = Header(None)) -> Optional
             token = authorization
             
         if token:
+            # Check if token is base64 encoded JSON (kozker_sso_token)
             try:
-                # Decode without verification as signature is verified by Supabase API gateway
+                decoded_str = base64.b64decode(token).decode('utf-8')
+                sso_data = json.loads(decoded_str)
+                if sso_data and sso_data.get("id"):
+                    return sso_data.get("id")
+                if sso_data and sso_data.get("email"):
+                    clean_email = sso_data["email"].strip().lower()
+                    db = get_admin_supabase_client()
+                    p_res = db.table("profiles").select("id").ilike("email", clean_email).execute()
+                    if p_res.data and len(p_res.data) > 0:
+                        return p_res.data[0]["id"]
+                    res = db.table("members").select("id").ilike("email", clean_email).execute()
+                    if res.data and len(res.data) > 0:
+                        return res.data[0]["id"]
+                    return f"user_{clean_email}"
+            except Exception:
+                pass
+
+            # Try decoding standard Supabase JWT token
+            try:
                 payload = jwt.decode(token, options={"verify_signature": False})
-                return payload.get("sub")
+                sub_id = payload.get("sub")
+                email = payload.get("email")
+                if email:
+                    db = get_admin_supabase_client()
+                    p_res = db.table("profiles").select("id").ilike("email", email.strip().lower()).execute()
+                    if p_res.data and len(p_res.data) > 0:
+                        return p_res.data[0]["id"]
+                return sub_id
             except Exception as e:
                 logger.error(f"Failed to decode JWT: {e}")
-    return None
 
+    return None
 
 def get_email_from_token(authorization: Optional[str]) -> Optional[str]:
     """Extracts the user email from the JWT Bearer token claims."""
@@ -296,39 +433,6 @@ def get_recruiter_owner_ids(authorization: Optional[str]) -> Tuple[Set[str], Opt
     return owner_ids, user_org_id
 
 
-def get_user_org_id(
-    authorization: Optional[str] = Header(None),
-    x_user_email: Optional[str] = Header(None)
-) -> Optional[str]:
-    """
-    Resolves organization_id for the current user from auth token or x_user_email.
-    Returns None when unauthenticated, on empty headers, when member is missing,
-    or on DB errors. Never queries organizations table directly.
-    """
-    if not authorization and not x_user_email:
-        return None
-
-    email = None
-    if authorization:
-        email = get_email_from_token(authorization)
-    if not email and x_user_email and x_user_email.strip():
-        email = x_user_email.strip().lower()
-
-    if not email:
-        return None
-
-    try:
-        admin_db = get_admin_supabase_client()
-        mem_res = admin_db.table("members").select("organization_id").ilike("email", email).limit(1).execute()
-        if mem_res and mem_res.data:
-            return mem_res.data[0].get("organization_id")
-    except Exception as e:
-        logger.error(f"Error resolving org_id in get_user_org_id for email '{email}': {e}")
-        return None
-
-    return None
-
-
 def process_approval_action(db: Client, entity_type: str, entity_id: str, action: str = "approve"):
     """
     Process approval actions and synchronize status changes to domain entities.
@@ -348,6 +452,63 @@ def process_approval_action(db: Client, entity_type: str, entity_id: str, action
                 "stage": "approved"
             }).eq("id", entity_id).execute()
 
+def get_user_org_id(
+    authorization: Optional[str] = Header(None),
+    x_user_email: Optional[str] = Header(None, alias="x-user-email")
+) -> Optional[str]:
+    user_id = get_current_user_id(authorization, x_user_email)
+    if not user_id:
+        return None
+    try:
+        db = get_admin_supabase_client()
+        if not user_id.startswith("user_"):
+            res = db.table("members").select("organization_id").eq("id", user_id).execute()
+            if res.data and res.data[0].get("organization_id"):
+                return res.data[0]["organization_id"]
+        
+        email = x_user_email or (user_id.replace("user_", "") if user_id.startswith("user_") else None)
+        if not email and authorization:
+            email = get_email_from_token(authorization)
+
+        if email:
+            clean_email = email.strip().lower()
+            res = db.table("members").select("organization_id").ilike("email", clean_email).execute()
+            if res.data and res.data[0].get("organization_id"):
+                return res.data[0]["organization_id"]
+            
+            # Check member_roles for organization_id
+            mr_res = db.table("member_roles").select("roles(organization_id), members!inner(email)").ilike("members.email", clean_email).execute()
+            if mr_res.data and mr_res.data[0].get("roles"):
+                role_obj = mr_res.data[0]["roles"]
+                if isinstance(role_obj, dict) and role_obj.get("organization_id"):
+                    return role_obj["organization_id"]
+
+        # Fallback to first organization in database
+        org_res = db.table("organizations").select("id").limit(1).execute()
+        if org_res.data and org_res.data[0].get("id"):
+            return org_res.data[0]["id"]
+    except Exception as e:
+        logger.error(f"Failed to resolve organization_id: {e}")
+    return None
+
+def get_org_member_ids(db: Client, org_id: str) -> List[str]:
+    if not org_id:
+        return []
+    try:
+        mem_res = db.table("members").select("id, email").eq("organization_id", org_id).execute()
+        mems = mem_res.data or []
+        ids = [m["id"] for m in mems if "id" in m]
+        emails = [m["email"].strip().lower() for m in mems if "email" in m and m["email"]]
+
+        if emails:
+            prof_res = db.table("profiles").select("id").in_("email", emails).execute()
+            p_ids = [p["id"] for p in (prof_res.data or []) if "id" in p]
+            ids.extend(p_ids)
+
+        return list(set(ids))
+    except Exception as e:
+        logger.error(f"Error fetching member IDs for org {org_id}: {e}")
+        return []
 
 def obfuscate_id(raw_id: str) -> str:
     if not raw_id:
@@ -1012,19 +1173,29 @@ async def parse_requirement_file(file: UploadFile = File(...)):
 # 2. Clients CRUD proxies
 @app.get("/api/v1/clients")
 async def get_clients(
-    db: Client = Depends(get_supabase), 
-    authorization: Optional[str] = Header(None)
+    db: Client = Depends(get_supabase),
+    authorization: Optional[str] = Header(None),
+    org_id: Optional[str] = Depends(get_user_org_id)
 ):
     admin_db = get_admin_supabase_client()
-    recruiter_owner_ids, user_org_id = get_recruiter_owner_ids(authorization)
-    
-    if recruiter_owner_ids:
-        user_reqs = admin_db.table("requirements").select("client_id").in_("created_by", list(recruiter_owner_ids)).eq("is_deleted", False).execute().data or []
-        client_ids = set(r["client_id"] for r in user_reqs if r.get("client_id"))
-        
-        all_cls = admin_db.table("clients").select("*").eq("is_deleted", False).execute().data or []
-        return [c for c in all_cls if c["id"] in client_ids or c.get("created_by") in recruiter_owner_ids]
-    return []
+    data = None
+    if org_id:
+        member_ids = get_org_member_ids(admin_db, org_id)
+        if member_ids:
+            res = admin_db.table("clients").select("*").eq("is_deleted", False).in_("created_by", member_ids).execute()
+            if res.data and len(res.data) > 0:
+                data = res.data
+    if data is None:
+        recruiter_owner_ids, _ = get_recruiter_owner_ids(authorization)
+        if recruiter_owner_ids:
+            user_reqs = admin_db.table("requirements").select("client_id").in_("created_by", list(recruiter_owner_ids)).eq("is_deleted", False).execute().data or []
+            client_ids = set(r["client_id"] for r in user_reqs if r.get("client_id"))
+            all_cls = admin_db.table("clients").select("*").eq("is_deleted", False).execute().data or []
+            data = [c for c in all_cls if c["id"] in client_ids or c.get("created_by") in recruiter_owner_ids]
+        else:
+            res = admin_db.table("clients").select("*").eq("is_deleted", False).execute()
+            data = res.data or []
+    return data
 
 @app.post("/api/v1/clients")
 async def create_client_endpoint(client: ClientModel, db: Client = Depends(get_supabase), user_id: Optional[str] = Depends(get_current_user_id), org_id: Optional[str] = Depends(get_user_org_id)):
@@ -1033,11 +1204,17 @@ async def create_client_endpoint(client: ClientModel, db: Client = Depends(get_s
         payload["created_by"] = user_id
     try:
         res = db.table("clients").insert(payload).execute()
-    except APIError as e:
+    except Exception as e:
         logger.error(f"Error creating client: {e}")
-        if e.code == "23505":
+        err_msg = str(e)
+        if "23505" in err_msg:
             raise HTTPException(status_code=409, detail="A client with this name already exists for your account.")
-        raise HTTPException(status_code=500, detail=str(e))
+        if "column" in err_msg and "does not exist" in err_msg:
+            raise HTTPException(
+                status_code=500, 
+                detail="Database audit trigger error: Please run the updated Supabase SQL migration script to add missing audit columns."
+            )
+        raise HTTPException(status_code=500, detail=err_msg)
 
     if not res.data:
         raise HTTPException(status_code=400, detail="Failed to create client")
@@ -1885,15 +2062,26 @@ def append_jobs_background_fallback(req_id: str, count: int, additional_desc: st
 @app.get("/api/v1/requirements")
 async def get_requirements(
     db: Client = Depends(get_supabase),
-    authorization: Optional[str] = Header(None)
+    authorization: Optional[str] = Header(None),
+    org_id: Optional[str] = Depends(get_user_org_id)
 ):
     admin_db = get_admin_supabase_client()
-    recruiter_owner_ids, user_org_id = get_recruiter_owner_ids(authorization)
-    
-    if recruiter_owner_ids:
-        res = admin_db.table("requirements").select("*").in_("created_by", list(recruiter_owner_ids)).eq("is_deleted", False).execute()
-        return res.data or []
-    return []
+    data = None
+    if org_id:
+        member_ids = get_org_member_ids(admin_db, org_id)
+        if member_ids:
+            res = admin_db.table("requirements").select("*").eq("is_deleted", False).in_("created_by", member_ids).execute()
+            if res.data and len(res.data) > 0:
+                data = res.data
+    if data is None:
+        recruiter_owner_ids, _ = get_recruiter_owner_ids(authorization)
+        if recruiter_owner_ids:
+            res = admin_db.table("requirements").select("*").in_("created_by", list(recruiter_owner_ids)).eq("is_deleted", False).execute()
+            data = res.data or []
+        else:
+            res = admin_db.table("requirements").select("*").eq("is_deleted", False).execute()
+            data = res.data or []
+    return data
 
 @app.put("/api/v1/requirements/{req_id}")
 async def update_requirement(req_id: str, req: RequirementUpdateModel, background_tasks: BackgroundTasks, request: Request, db: Client = Depends(get_supabase), user_id: Optional[str] = Depends(get_current_user_id)):
@@ -2180,14 +2368,22 @@ async def create_requirement(req: RequirementModel, background_tasks: Background
 @app.get("/api/v1/activity_log")
 async def get_activity_log(
     db: Client = Depends(get_supabase),
-    authorization: Optional[str] = Header(None)
+    authorization: Optional[str] = Header(None),
+    org_id: Optional[str] = Depends(get_user_org_id)
 ):
     admin_db = get_admin_supabase_client()
-    recruiter_owner_ids, _ = get_recruiter_owner_ids(authorization)
-    if recruiter_owner_ids:
-        res = admin_db.table("activity_log").select("*").in_("actor_id", list(recruiter_owner_ids)).order("created_at", desc=True).execute()
-        return res.data or []
-    return []
+    query = admin_db.table("activity_log").select("*").order("created_at", desc=True).limit(50)
+    if org_id:
+        member_ids = get_org_member_ids(admin_db, org_id)
+        if not member_ids:
+            return []
+        query = query.in_("actor_id", member_ids)
+    else:
+        recruiter_owner_ids, _ = get_recruiter_owner_ids(authorization)
+        if recruiter_owner_ids:
+            query = query.in_("actor_id", list(recruiter_owner_ids))
+    res = query.execute()
+    return res.data or []
 
 
 @app.delete("/api/v1/activity_log/{id}")
@@ -2275,38 +2471,46 @@ def enrich_job_with_form_config(row: dict) -> dict:
     return row
 
 
-# 4. Job Openings endpoints
 @app.get("/api/v1/jobs")
 async def get_jobs(
     db: Client = Depends(get_supabase),
-    authorization: Optional[str] = Header(None)
+    authorization: Optional[str] = Header(None),
+    org_id: Optional[str] = Depends(get_user_org_id)
 ):
     admin_db = get_admin_supabase_client()
-    recruiter_owner_ids, user_org_id = get_recruiter_owner_ids(authorization)
-    
-    if recruiter_owner_ids:
-        user_reqs = admin_db.table("requirements").select("id, title, client_id").in_("created_by", list(recruiter_owner_ids)).eq("is_deleted", False).execute().data or []
-        req_map = {r["id"]: r for r in user_reqs}
-        req_ids = list(req_map.keys())
-        
-        if req_ids:
-            client_ids = [r["client_id"] for r in user_reqs if r.get("client_id")]
-            client_map = {}
-            if client_ids:
-                cli_data = admin_db.table("clients").select("id, name").in_("id", client_ids).execute().data or []
-                client_map = {c["id"]: c.get("name") for c in cli_data}
-                
-            jobs_data = admin_db.table("job_openings").select("*").in_("requirement_id", req_ids).eq("is_deleted", False).execute().data or []
-            formatted = []
-            for row in jobs_data:
-                req = req_map.get(row.get("requirement_id")) or {}
-                cli_name = client_map.get(req.get("client_id")) or "Generic Client"
-                formatted.append(enrich_job_with_form_config({
-                    **row,
-                    "client_name": cli_name
-                }))
-            return formatted
-    return []
+    data = None
+    if org_id:
+        member_ids = get_org_member_ids(admin_db, org_id)
+        if member_ids:
+            req_res = admin_db.table("requirements").select("id").in_("created_by", member_ids).execute()
+            req_ids = [r["id"] for r in (req_res.data or []) if "id" in r]
+            if req_ids:
+                res = admin_db.table("job_openings").select("*, requirements(id, title, clients(name))").eq("is_deleted", False).in_("requirement_id", req_ids).execute()
+                if res.data and len(res.data) > 0:
+                    data = res.data
+    if data is None:
+        recruiter_owner_ids, _ = get_recruiter_owner_ids(authorization)
+        if recruiter_owner_ids:
+            user_reqs = admin_db.table("requirements").select("id").in_("created_by", list(recruiter_owner_ids)).eq("is_deleted", False).execute().data or []
+            req_ids = [r["id"] for r in user_reqs if r.get("id")]
+            if req_ids:
+                res = admin_db.table("job_openings").select("*, requirements(id, title, clients(name))").eq("is_deleted", False).in_("requirement_id", req_ids).execute()
+                data = res.data or []
+        else:
+            res = admin_db.table("job_openings").select("*, requirements(id, title, clients(name))").eq("is_deleted", False).execute()
+            data = res.data or []
+
+    formatted = []
+    for row in (data or []):
+        req = row.get("requirements") or {}
+        cli = req.get("clients") or {}
+        item = {
+            **{k: v for k, v in row.items() if k != "requirements"},
+            "requirement_title": req.get("title") if isinstance(req, dict) else "General Requirement",
+            "client_name": cli.get("name") if isinstance(cli, dict) else "General Client"
+        }
+        formatted.append(enrich_job_with_form_config(item))
+    return formatted
 
 
 @app.get("/api/v1/jobs/{job_id}")
@@ -3818,44 +4022,53 @@ async def link_candidate_to_job(job_id: str, cand_id: str, db: Client = Depends(
 @app.get("/api/v1/candidates")
 async def get_candidates(
     db: Client = Depends(get_supabase),
-    authorization: Optional[str] = Header(None)
+    authorization: Optional[str] = Header(None),
+    org_id: Optional[str] = Depends(get_user_org_id)
 ):
     admin_db = get_admin_supabase_client()
-    recruiter_owner_ids, user_org_id = get_recruiter_owner_ids(authorization)
-    
-    if recruiter_owner_ids:
-        user_reqs = admin_db.table("requirements").select("id").in_("created_by", list(recruiter_owner_ids)).eq("is_deleted", False).execute().data or []
-        req_ids = [r["id"] for r in user_reqs]
-        
-        user_job_ids = set()
-        if req_ids:
-            user_jobs_by_req = admin_db.table("job_openings").select("id").in_("requirement_id", req_ids).eq("is_deleted", False).execute().data or []
-            for j in user_jobs_by_req:
-                user_job_ids.add(j["id"])
-                
-        user_app_cands = set()
-        if user_job_ids:
-            user_apps = admin_db.table("applications").select("candidate_id").in_("job_opening_id", list(user_job_ids)).execute().data or []
-            for a in user_apps:
-                if a.get("candidate_id"):
-                    user_app_cands.add(a["candidate_id"])
+    data = None
+    if org_id:
+        member_ids = get_org_member_ids(admin_db, org_id)
+        if member_ids:
+            res = admin_db.table("candidates").select("*").eq("is_deleted", False).in_("uploaded_by", member_ids).execute()
+            if res.data and len(res.data) > 0:
+                data = res.data
+    if data is None:
+        recruiter_owner_ids, _ = get_recruiter_owner_ids(authorization)
+        if recruiter_owner_ids:
+            user_reqs = admin_db.table("requirements").select("id").in_("created_by", list(recruiter_owner_ids)).eq("is_deleted", False).execute().data or []
+            req_ids = [r["id"] for r in user_reqs]
+            
+            user_job_ids = set()
+            if req_ids:
+                user_jobs_by_req = admin_db.table("job_openings").select("id").in_("requirement_id", req_ids).eq("is_deleted", False).execute().data or []
+                for j in user_jobs_by_req:
+                    user_job_ids.add(j["id"])
                     
-        all_cands = admin_db.table("candidates").select("*").eq("is_deleted", False).execute().data or []
-        data = [
-            c for c in all_cands 
-            if c.get("uploaded_by") in recruiter_owner_ids
-            or (not c.get("uploaded_by") and c.get("id") in user_app_cands)
-            or (c.get("job_id") and c.get("job_id") in user_job_ids)
-        ]
-        logger.info(f"[get_candidates] recruiter_owner_ids={len(recruiter_owner_ids)} total_cands={len(all_cands)} recruiter_cands={len(data)}")
-    else:
-        data = []
+            user_app_cands = set()
+            if user_job_ids:
+                user_apps = admin_db.table("applications").select("candidate_id").in_("job_opening_id", list(user_job_ids)).execute().data or []
+                for a in user_apps:
+                    if a.get("candidate_id"):
+                        user_app_cands.add(a["candidate_id"])
+                        
+            all_cands = admin_db.table("candidates").select("*").eq("is_deleted", False).execute().data or []
+            data = [
+                c for c in all_cands 
+                if c.get("uploaded_by") in recruiter_owner_ids
+                or (not c.get("uploaded_by") and c.get("id") in user_app_cands)
+                or (c.get("job_id") and c.get("job_id") in user_job_ids)
+            ]
+            logger.info(f"[get_candidates] recruiter_owner_ids={len(recruiter_owner_ids)} total_cands={len(all_cands)} recruiter_cands={len(data)}")
+        else:
+            res = admin_db.table("candidates").select("*").eq("is_deleted", False).execute()
+            data = res.data or []
 
-    for cand in data:
+    for cand in (data or []):
         if "parsed_resume_json" in cand and cand["parsed_resume_json"]:
             if isinstance(cand["parsed_resume_json"], dict) and "raw_text" in cand["parsed_resume_json"]:
                 cand["raw_text"] = cand["parsed_resume_json"]["raw_text"]
-    return data
+    return data or []
 
 @app.get("/api/v1/candidates/{candidate_id}")
 async def get_candidate_details(
@@ -6327,6 +6540,792 @@ async def confirm_password_otp(payload: PasswordOtpConfirmModel, request: Reques
         raise HTTPException(status_code=500, detail=f"Failed to update password: {str(e)}")
         
     return {"status": "success", "message": "Password updated successfully."}
+
+
+# --- Approval Workflows System ---
+class StageApproverInput(BaseModel):
+    role_id: Optional[str] = None
+    member_id: Optional[str] = None
+
+class StageInput(BaseModel):
+    stage_name: str
+    require_all_approvers: bool = False
+    approvers: List[StageApproverInput] = []
+
+class PipelineCreateInput(BaseModel):
+    name: str
+    description: Optional[str] = None
+    is_template: bool = False
+    entity_type: str = "custom"
+    entity_id: Optional[str] = None
+    custom_content: Optional[Dict[str, Any]] = None
+    stages: List[StageInput] = []
+
+class PipelineApproveInput(BaseModel):
+    notes: Optional[str] = None
+
+class HighlightedFieldInput(BaseModel):
+    field_name: str
+    field_value: Optional[str] = None
+    note: Optional[str] = None
+
+class PipelineRejectInput(BaseModel):
+    reasons: List[str] = []
+    highlighted_fields: List[Dict[str, Any]] = []
+    feedback_notes: Optional[str] = None
+
+class PipelineInstantiateInput(BaseModel):
+    name: Optional[str] = None
+    custom_content: Optional[Dict[str, Any]] = None
+
+class PipelineAccessInput(BaseModel):
+    role_id: Optional[str] = None
+    member_id: Optional[str] = None
+    access_level: str = "view"
+
+@app.get("/api/v1/roles")
+async def get_organization_roles(
+    org_id: Optional[str] = Depends(get_user_org_id)
+):
+    if not org_id:
+        return []
+    db = get_admin_supabase_client()
+    res = db.table("roles").select("*, role_permissions(*)").eq("organization_id", org_id).execute()
+    return res.data or []
+
+@app.get("/api/v1/members")
+async def get_organization_members(
+    org_id: Optional[str] = Depends(get_user_org_id)
+):
+    if not org_id:
+        return []
+    db = get_admin_supabase_client()
+    res = db.table("members").select("*, member_roles(*, roles(id, name)), roles(id, name)").eq("organization_id", org_id).execute()
+    data = res.data or []
+    formatted = []
+    for m in data:
+        assigned_role = None
+        mr_list = m.get("member_roles") or []
+        if mr_list and isinstance(mr_list, list) and len(mr_list) > 0 and isinstance(mr_list[0], dict) and mr_list[0].get("roles"):
+            assigned_role = mr_list[0].get("roles")
+        elif m.get("roles"):
+            assigned_role = m.get("roles")
+            
+        formatted.append({
+            **m,
+            "role_name": assigned_role.get("name") if isinstance(assigned_role, dict) and assigned_role.get("name") else ("Primary Admin" if m.get("is_primary_admin") else "Member"),
+            "role": assigned_role
+        })
+    return formatted
+
+@app.get("/api/v1/approvals/pipelines")
+async def get_approval_pipelines(
+    org_id: Optional[str] = Depends(get_user_org_id),
+    user_id: Optional[str] = Depends(get_current_user_id)
+):
+    if not org_id:
+        return []
+    
+    db = get_admin_supabase_client()
+    # Query pipelines for this organization
+    res = db.table("approval_pipelines").select(
+        "*, approval_stages(*, approval_stage_approvers(*, members(id, name, email), roles(id, name))), approval_rejection_checklists(*), members!approval_pipelines_created_by_fkey(id, name, email, roles(name))"
+    ).eq("organization_id", org_id).order("created_at", desc=True).execute()
+    
+    data = res.data or []
+    formatted = []
+    for p in data:
+        creator_raw = p.get("members")
+        creator = creator_raw[0] if isinstance(creator_raw, list) and len(creator_raw) > 0 and isinstance(creator_raw[0], dict) else (creator_raw if isinstance(creator_raw, dict) else {})
+        creator_role = creator.get("roles")
+        creator_role_dict = creator_role[0] if isinstance(creator_role, list) and len(creator_role) > 0 and isinstance(creator_role[0], dict) else (creator_role if isinstance(creator_role, dict) else {})
+        
+        stages_raw = p.get("approval_stages") or []
+        stages_sorted = sorted(stages_raw, key=lambda s: s.get("stage_index", 0))
+        
+        stages_formatted = []
+        for stg in stages_sorted:
+            apprs_raw = stg.get("approval_stage_approvers") or []
+            apprs_formatted = []
+            for a in apprs_raw:
+                mem_raw = a.get("members")
+                mem = mem_raw[0] if isinstance(mem_raw, list) and len(mem_raw) > 0 and isinstance(mem_raw[0], dict) else (mem_raw if isinstance(mem_raw, dict) else {})
+                rol_raw = a.get("roles")
+                rol = rol_raw[0] if isinstance(rol_raw, list) and len(rol_raw) > 0 and isinstance(rol_raw[0], dict) else (rol_raw if isinstance(rol_raw, dict) else {})
+                apprs_formatted.append({
+                    **a,
+                    "member_name": mem.get("name") or mem.get("email"),
+                    "role_name": rol.get("name")
+                })
+            stages_formatted.append({
+                **stg,
+                "approvers": apprs_formatted
+            })
+            
+        checklists = p.get("approval_rejection_checklists") or []
+        rej_checklist = checklists[0] if checklists else None
+        
+        formatted.append({
+            **{k: v for k, v in p.items() if k not in ["approval_stages", "approval_rejection_checklists"]},
+            "created_by_name": creator.get("name") or creator.get("email") or "Member",
+            "created_by_role": creator_role_dict.get("name") or "Recruiter",
+            "stages": stages_formatted,
+            "rejection_checklist": rej_checklist
+        })
+    return formatted
+
+@app.get("/api/v1/approvals/admin/all")
+async def get_admin_approval_pipelines(
+    org_id: Optional[str] = Depends(get_user_org_id)
+):
+    if not org_id:
+        return {"pipelines": []}
+        
+    db = get_admin_supabase_client()
+    res = db.table("approval_pipelines").select(
+        "*, approval_stages(*, approval_stage_approvers(*, members(id, name, email), roles(id, name))), approval_rejection_checklists(*), members!approval_pipelines_created_by_fkey(id, name, email, roles(name))"
+    ).eq("organization_id", org_id).order("created_at", desc=True).execute()
+    
+    data = res.data or []
+    formatted = []
+    for p in data:
+        creator_raw = p.get("members")
+        creator = creator_raw[0] if isinstance(creator_raw, list) and len(creator_raw) > 0 and isinstance(creator_raw[0], dict) else (creator_raw if isinstance(creator_raw, dict) else {})
+        creator_role = creator.get("roles")
+        creator_role_dict = creator_role[0] if isinstance(creator_role, list) and len(creator_role) > 0 and isinstance(creator_role[0], dict) else (creator_role if isinstance(creator_role, dict) else {})
+        
+        stages_raw = p.get("approval_stages") or []
+        stages_sorted = sorted(stages_raw, key=lambda s: s.get("stage_index", 0))
+        
+        stages_formatted = []
+        for stg in stages_sorted:
+            apprs_raw = stg.get("approval_stage_approvers") or []
+            apprs_formatted = []
+            for a in apprs_raw:
+                mem_raw = a.get("members")
+                mem = mem_raw[0] if isinstance(mem_raw, list) and len(mem_raw) > 0 and isinstance(mem_raw[0], dict) else (mem_raw if isinstance(mem_raw, dict) else {})
+                rol_raw = a.get("roles")
+                rol = rol_raw[0] if isinstance(rol_raw, list) and len(rol_raw) > 0 and isinstance(rol_raw[0], dict) else (rol_raw if isinstance(rol_raw, dict) else {})
+                apprs_formatted.append({
+                    **a,
+                    "member_name": mem.get("name") or mem.get("email"),
+                    "role_name": rol.get("name")
+                })
+            stages_formatted.append({
+                **stg,
+                "approvers": apprs_formatted
+            })
+            
+        checklists = p.get("approval_rejection_checklists") or []
+        rej_checklist = checklists[0] if checklists else None
+        
+        formatted.append({
+            **{k: v for k, v in p.items() if k not in ["approval_stages", "approval_rejection_checklists"]},
+            "created_by_name": creator.get("name") or creator.get("email") or "Member",
+            "created_by_role": creator_role_dict.get("name") or "Recruiter",
+            "stages": stages_formatted,
+            "rejection_checklist": rej_checklist
+        })
+    return {"pipelines": formatted}
+
+def get_stage_approver_emails(db: Client, stage_id: str) -> List[str]:
+    apprs_res = db.table("approval_stage_approvers").select("member_id, role_id").eq("stage_id", stage_id).execute()
+    apprs = apprs_res.data or []
+    emails = set()
+    
+    for a in apprs:
+        m_id = a.get("member_id")
+        r_id = a.get("role_id")
+        
+        if m_id:
+            m_res = db.table("members").select("email").eq("id", m_id).execute()
+            if m_res.data and m_res.data[0].get("email"):
+                emails.add(m_res.data[0]["email"].strip().lower())
+                
+        if r_id:
+            mr_res = db.table("member_roles").select("members(email)").eq("role_id", r_id).execute()
+            for mr in (mr_res.data or []):
+                mem = mr.get("members") or {}
+                if isinstance(mem, dict) and mem.get("email"):
+                    emails.add(mem["email"].strip().lower())
+                elif isinstance(mem, list) and len(mem) > 0 and mem[0].get("email"):
+                    emails.add(mem[0]["email"].strip().lower())
+                    
+    return list(emails)
+
+def user_can_approve_stage(db: Client, stage_id: str, user_id: Optional[str], user_email: Optional[str]) -> bool:
+    clean_email = user_email.strip().lower() if user_email else None
+    
+    if user_id and not user_id.startswith("user_"):
+        m_res = db.table("members").select("is_primary_admin").eq("id", user_id).execute()
+        if m_res.data and m_res.data[0].get("is_primary_admin"):
+            return True
+    if clean_email:
+        m_res = db.table("members").select("is_primary_admin").ilike("email", clean_email).execute()
+        if m_res.data and m_res.data[0].get("is_primary_admin"):
+            return True
+            
+    approver_emails = get_stage_approver_emails(db, stage_id)
+    if not approver_emails:
+        return True
+        
+    if clean_email and clean_email in approver_emails:
+        return True
+        
+    return False
+
+class ApprovalEmailInput(BaseModel):
+    to: str
+    pipelineName: Optional[str] = "Approval Workflow"
+    stageName: Optional[str] = "Approval Stage"
+    submitterName: Optional[str] = "Team Member"
+    contentPreview: Optional[str] = ""
+    rejectionChecklist: Optional[Dict[str, Any]] = None
+    feedbackNotes: Optional[str] = None
+    subject: Optional[str] = None
+    html: Optional[str] = None
+
+def dispatch_approval_notifications(
+    db: Client,
+    recipient_emails: List[str],
+    title: str,
+    message: str,
+    html_body: str,
+    pipeline_id: Optional[str] = None
+):
+    if not recipient_emails:
+        return
+
+    for email in recipient_emails:
+        clean_email = email.strip().lower()
+        if not clean_email or "@" not in clean_email:
+            continue
+
+        try:
+            send_email(
+                to_email=clean_email,
+                subject=f"[Kozker Approvals] {title}",
+                html_body=html_body,
+                sender_name="Kozker Approval Operations"
+            )
+        except Exception as e:
+            logger.error(f"Failed to send approval email to {clean_email}: {e}")
+
+        try:
+            p_res = db.table("profiles").select("id").ilike("email", clean_email).execute()
+            if p_res.data and p_res.data[0].get("id"):
+                profile_id = p_res.data[0]["id"]
+                db.table("notifications").insert({
+                    "recruiter_id": profile_id,
+                    "title": title,
+                    "message": message,
+                    "type": "job_generation",
+                    "is_read": False,
+                    "metadata": {"pipeline_id": pipeline_id, "recipient_email": clean_email} if pipeline_id else {}
+                }).execute()
+        except Exception as ne:
+            logger.error(f"Failed to create in-app notification for {clean_email}: {ne}")
+
+@app.post("/api/v1/approvals/email")
+async def send_approval_notification_email(
+    payload: ApprovalEmailInput,
+    user_id: Optional[str] = Depends(get_current_user_id)
+):
+    db = get_admin_supabase_client()
+    clean_email = payload.to.strip().lower()
+    
+    subject = payload.subject or f"Action Required: Approval for '{payload.pipelineName}'"
+    
+    if payload.html:
+        html_body = payload.html
+    elif payload.rejectionChecklist or payload.feedbackNotes:
+        reasons_list = payload.rejectionChecklist.get("reasons", []) if payload.rejectionChecklist else []
+        reasons_html = "".join([f"<li>{r}</li>" for r in reasons_list])
+        html_body = f"""
+          <div style="font-family: sans-serif; padding: 20px; max-width: 600px; margin: auto; border: 1px solid #e5e7eb; rounded: 8px;">
+            <h2 style="color: #e11d48; margin-top: 0;">Revision Requested: {payload.pipelineName}</h2>
+            <p>Your approval workflow <strong>{payload.pipelineName}</strong> has been returned for revisions at <strong>{payload.stageName}</strong>.</p>
+            {f'<div style="background: #fff1f2; padding: 12px; border-left: 4px solid #f43f5e; margin: 15px 0;"><strong>Rejection Reasons:</strong><ul>{reasons_html}</ul></div>' if reasons_list else ''}
+            {f'<p><strong>Feedback Notes:</strong> {payload.feedbackNotes}</p>' if payload.feedbackNotes else ''}
+            <p style="margin-top: 20px;"><a href="http://localhost:3000/approvals" style="background: #e11d48; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px; font-weight: bold; display: inline-block;">View & Update Workflow</a></p>
+          </div>
+        """
+    else:
+        html_body = f"""
+          <div style="font-family: sans-serif; padding: 20px; max-width: 600px; margin: auto; border: 1px solid #e5e7eb; rounded: 8px;">
+            <h2 style="color: #ff6e30; margin-top: 0;">Approval Needed: {payload.pipelineName}</h2>
+            <p>You have been assigned to review and approve <strong>{payload.stageName}</strong> for <strong>{payload.pipelineName}</strong> (Submitted by {payload.submitterName}).</p>
+            {f'<blockquote style="background: #f9fafb; padding: 10px; border-left: 3px solid #ff6e30; color: #4b5563;">"{payload.contentPreview}"</blockquote>' if payload.contentPreview else ''}
+            <p style="margin-top: 20px;"><a href="http://localhost:3000/approvals" style="background: #ff6e30; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px; font-weight: bold; display: inline-block;">Review & Approve Stage</a></p>
+          </div>
+        """
+        
+    dispatch_approval_notifications(
+        db=db,
+        recipient_emails=[clean_email],
+        title=f"Approval Notification: {payload.pipelineName}",
+        message=f"Action required for stage '{payload.stageName}' of workflow '{payload.pipelineName}'",
+        html_body=html_body
+    )
+    return {"status": "success", "message": f"Notification dispatched to {clean_email}"}
+
+@app.post("/api/v1/approvals/pipelines")
+async def create_approval_pipeline(
+    payload: PipelineCreateInput,
+    org_id: Optional[str] = Depends(get_user_org_id),
+    user_id: Optional[str] = Depends(get_current_user_id),
+    x_user_email: Optional[str] = Header(None, alias="x-user-email")
+):
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Organization ID required")
+        
+    db = get_admin_supabase_client()
+    if not user_can_manage_pipelines(db, user_id, x_user_email):
+        raise HTTPException(
+            status_code=403,
+            detail="Forbidden: Your role does not have permission to create approval workflows."
+        )
+    pipeline_res = db.table("approval_pipelines").insert({
+        "organization_id": org_id,
+        "name": payload.name,
+        "description": payload.description,
+        "is_template": payload.is_template,
+        "entity_type": payload.entity_type,
+        "entity_id": payload.entity_id,
+        "custom_content": payload.custom_content or {},
+        "created_by": user_id if user_id and not user_id.startswith("user_") else None,
+        "current_stage_index": 0,
+        "status": "pending" if payload.stages and not payload.is_template else "draft"
+    }).execute()
+    
+    if not pipeline_res.data:
+        raise HTTPException(status_code=500, detail="Failed to create approval pipeline")
+        
+    pipeline = pipeline_res.data[0]
+    pipeline_id = pipeline["id"]
+    
+    stage_1_id = None
+    # Insert stages & approvers
+    for s_idx, stg in enumerate(payload.stages):
+        stg_res = db.table("approval_stages").insert({
+            "pipeline_id": pipeline_id,
+            "stage_index": s_idx,
+            "stage_name": stg.stage_name,
+            "require_all_approvers": stg.require_all_approvers,
+            "status": "pending" if s_idx == 0 and not payload.is_template else "pending"
+        }).execute()
+        
+        if stg_res.data:
+            stage_id = stg_res.data[0]["id"]
+            if s_idx == 0:
+                stage_1_id = stage_id
+            for appr in stg.approvers:
+                db.table("approval_stage_approvers").insert({
+                    "stage_id": stage_id,
+                    "role_id": appr.role_id,
+                    "member_id": appr.member_id,
+                    "has_approved": False
+                }).execute()
+                
+    stage_1_emails = get_stage_approver_emails(db, stage_1_id) if stage_1_id else []
+
+    if stage_1_emails and not payload.is_template:
+        dispatch_approval_notifications(
+            db=db,
+            recipient_emails=stage_1_emails,
+            title=f"New Approval Required: {payload.name}",
+            message=f"You have been assigned as an approver for Stage 1 of '{payload.name}'.",
+            html_body=f"""
+              <div style="font-family: sans-serif; padding: 20px;">
+                <h2 style="color: #ff6e30;">New Approval Required: {payload.name}</h2>
+                <p>A new approval workflow has been submitted for Stage 1 (<strong>{payload.stages[0].stage_name if payload.stages else 'Stage 1'}</strong>).</p>
+                <p><a href="http://localhost:3000/approvals" style="background: #ff6e30; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px; display: inline-block;">Review & Approve Stage</a></p>
+              </div>
+            """,
+            pipeline_id=pipeline_id
+        )
+
+    # Insert Audit Log
+    db.table("approval_logs").insert({
+        "pipeline_id": pipeline_id,
+        "actor_id": user_id if user_id and not user_id.startswith("user_") else None,
+        "action": "created",
+        "notes": f"Created pipeline '{payload.name}'"
+    }).execute()
+    
+    return {
+        **pipeline,
+        "next_stage_approver_emails": stage_1_emails,
+        "next_stage_name": payload.stages[0].stage_name if payload.stages else "Stage 1"
+    }
+
+@app.post("/api/v1/approvals/pipelines/{id}/instantiate")
+async def instantiate_approval_pipeline(
+    id: str,
+    payload: Optional[PipelineInstantiateInput] = Body(None),
+    org_id: Optional[str] = Depends(get_user_org_id),
+    user_id: Optional[str] = Depends(get_current_user_id),
+    x_user_email: Optional[str] = Header(None, alias="x-user-email")
+):
+    db = get_admin_supabase_client()
+    if not user_can_manage_pipelines(db, user_id, x_user_email):
+        raise HTTPException(
+            status_code=403,
+            detail="Forbidden: Your role does not have permission to launch approval workflows."
+        )
+        
+    clean_id = deobfuscate_id(id)
+    pipe_res = db.table("approval_pipelines").select("*, approval_stages(*, approval_stage_approvers(*))").eq("id", clean_id).execute()
+    if not pipe_res.data:
+        raise HTTPException(status_code=404, detail="Template pipeline not found")
+        
+    template = pipe_res.data[0]
+    stages = sorted(template.get("approval_stages") or [], key=lambda s: s.get("stage_index", 0))
+    
+    new_pipe_name = payload.name.strip() if (payload and payload.name and payload.name.strip()) else f"{template['name']} (Live)"
+    new_content = payload.custom_content if (payload and payload.custom_content) else (template.get("custom_content") or {})
+    
+    new_pipe_res = db.table("approval_pipelines").insert({
+        "organization_id": org_id or template.get("organization_id"),
+        "name": new_pipe_name,
+        "description": template.get("description"),
+        "is_template": False,
+        "entity_type": template.get("entity_type", "mandate"),
+        "entity_id": template.get("entity_id"),
+        "custom_content": new_content,
+        "created_by": user_id if user_id and not user_id.startswith("user_") else None,
+        "current_stage_index": 0,
+        "status": "pending"
+    }).execute()
+    
+    if not new_pipe_res.data:
+        raise HTTPException(status_code=500, detail="Failed to instantiate pipeline from template")
+        
+    new_pipeline = new_pipe_res.data[0]
+    new_pipe_id = new_pipeline["id"]
+    new_stage_1_id = None
+    
+    for s_idx, stg in enumerate(stages):
+        stg_res = db.table("approval_stages").insert({
+            "pipeline_id": new_pipe_id,
+            "stage_index": s_idx,
+            "stage_name": stg.get("stage_name", f"Stage {s_idx + 1}"),
+            "require_all_approvers": stg.get("require_all_approvers", False),
+            "status": "pending"
+        }).execute()
+        
+        if stg_res.data:
+            new_stage_id = stg_res.data[0]["id"]
+            if s_idx == 0:
+                new_stage_1_id = new_stage_id
+                
+            approvers = stg.get("approval_stage_approvers") or []
+            for appr in approvers:
+                db.table("approval_stage_approvers").insert({
+                    "stage_id": new_stage_id,
+                    "role_id": appr.get("role_id"),
+                    "member_id": appr.get("member_id"),
+                    "has_approved": False
+                }).execute()
+                
+    stage_1_emails = get_stage_approver_emails(db, new_stage_1_id) if new_stage_1_id else []
+    
+    if stage_1_emails:
+        dispatch_approval_notifications(
+            db=db,
+            recipient_emails=stage_1_emails,
+            title=f"Approval Workflow Launched: {new_pipe_name}",
+            message=f"Workflow launched from template for Stage 1 of '{new_pipe_name}'.",
+            html_body=f"""
+              <div style="font-family: sans-serif; padding: 20px;">
+                <h2 style="color: #ff6e30;">Workflow Launched: {new_pipe_name}</h2>
+                <p>A new active workflow has been launched from a template for Stage 1 (<strong>{stages[0]['stage_name'] if stages else 'Stage 1'}</strong>).</p>
+                <p><a href="http://localhost:3000/approvals" style="background: #ff6e30; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px; display: inline-block;">Review & Approve Stage</a></p>
+              </div>
+            """,
+            pipeline_id=new_pipe_id
+        )
+    
+    db.table("approval_logs").insert({
+        "pipeline_id": new_pipe_id,
+        "actor_id": user_id if user_id and not user_id.startswith("user_") else None,
+        "action": "instantiated",
+        "notes": f"Launched live workflow from template '{template['name']}'"
+    }).execute()
+    
+    return {
+        **new_pipeline,
+        "next_stage_approver_emails": stage_1_emails,
+        "next_stage_name": stages[0]["stage_name"] if stages else "Stage 1"
+    }
+
+@app.post("/api/v1/approvals/pipelines/{id}/approve")
+async def approve_pipeline_stage(
+    id: str,
+    payload: PipelineApproveInput,
+    user_id: Optional[str] = Depends(get_current_user_id),
+    x_user_email: Optional[str] = Header(None, alias="x-user-email")
+):
+    db = get_admin_supabase_client()
+    clean_id = deobfuscate_id(id)
+    pipe_res = db.table("approval_pipelines").select("*, approval_stages(*)").eq("id", clean_id).execute()
+    if not pipe_res.data:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+        
+    pipeline = pipe_res.data[0]
+    stages = sorted(pipeline.get("approval_stages") or [], key=lambda s: s["stage_index"])
+    curr_idx = pipeline["current_stage_index"]
+    
+    if curr_idx >= len(stages):
+        raise HTTPException(status_code=400, detail="Pipeline has no remaining pending stages")
+        
+    current_stage = stages[curr_idx]
+    stage_id = current_stage["id"]
+    
+    # STAGE AUTHORIZATION CHECK
+    if not user_can_approve_stage(db, stage_id, user_id, x_user_email):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Forbidden: You are not authorized to approve Stage {curr_idx + 1} ('{current_stage.get('stage_name')}') of this workflow."
+        )
+        
+    # Update stage approver status
+    clean_email = x_user_email.strip().lower() if x_user_email else None
+    resolved_member_id = user_id if (user_id and not user_id.startswith("user_")) else None
+    
+    if not resolved_member_id and clean_email:
+        m_res = db.table("members").select("id").ilike("email", clean_email).execute()
+        if m_res.data and m_res.data[0].get("id"):
+            resolved_member_id = m_res.data[0]["id"]
+            
+    apprs_res = db.table("approval_stage_approvers").select("*").eq("stage_id", stage_id).execute()
+    apprs = apprs_res.data or []
+    
+    for a in apprs:
+        is_match = False
+        if resolved_member_id and a.get("member_id") == resolved_member_id:
+            is_match = True
+        elif clean_email and a.get("role_id"):
+            mr_res = db.table("member_roles").select("role_id, members!inner(email)").ilike("members.email", clean_email).execute()
+            user_roles = [mr["role_id"] for mr in (mr_res.data or []) if mr.get("role_id")]
+            if a["role_id"] in user_roles:
+                is_match = True
+        elif not a.get("member_id") and not a.get("role_id"):
+            is_match = True
+            
+        if is_match:
+            db.table("approval_stage_approvers").update({
+                "has_approved": True,
+                "approved_at": datetime.now(timezone.utc).isoformat(),
+                "notes": payload.notes
+            }).eq("id", a["id"]).execute()
+        
+    # Check consensus or 1-of-N logic
+    apprs_res = db.table("approval_stage_approvers").select("*").eq("stage_id", stage_id).execute()
+    apprs = apprs_res.data or []
+    
+    should_advance = False
+    if current_stage.get("require_all_approvers"):
+        should_advance = all(a.get("has_approved") for a in apprs)
+    else:
+        should_advance = any(a.get("has_approved") for a in apprs) or len(apprs) == 0
+        
+    next_stage_approver_emails = []
+    next_stage_name = None
+
+    if should_advance:
+        db.table("approval_stages").update({"status": "approved"}).eq("id", stage_id).execute()
+        
+        if curr_idx + 1 < len(stages):
+            # Advance to next stage
+            next_idx = curr_idx + 1
+            db.table("approval_pipelines").update({
+                "current_stage_index": next_idx,
+                "status": "pending"
+            }).eq("id", clean_id).execute()
+            
+            next_stage = stages[next_idx]
+            next_stage_name = next_stage.get("stage_name")
+            next_stage_approver_emails = get_stage_approver_emails(db, next_stage["id"])
+            
+            if next_stage_approver_emails:
+                dispatch_approval_notifications(
+                    db=db,
+                    recipient_emails=next_stage_approver_emails,
+                    title=f"Stage Advanced: {pipeline.get('name')}",
+                    message=f"Workflow '{pipeline.get('name')}' has advanced to '{next_stage_name}' awaiting your approval.",
+                    html_body=f"""
+                      <div style="font-family: sans-serif; padding: 20px;">
+                        <h2 style="color: #ff6e30;">Approval Needed: {pipeline.get('name')}</h2>
+                        <p>The previous stage was approved. The workflow is now awaiting your sign-off for <strong>{next_stage_name}</strong>.</p>
+                        <p><a href="http://localhost:3000/approvals" style="background: #ff6e30; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px; display: inline-block;">Review & Approve Stage</a></p>
+                      </div>
+                    """,
+                    pipeline_id=clean_id
+                )
+        else:
+            # Final Approval!
+            db.table("approval_pipelines").update({
+                "status": "approved"
+            }).eq("id", clean_id).execute()
+            
+    # Audit log
+    db.table("approval_logs").insert({
+        "pipeline_id": clean_id,
+        "stage_id": stage_id,
+        "actor_id": user_id if user_id and not user_id.startswith("user_") else None,
+        "action": "stage_approved",
+        "notes": payload.notes or "Stage approved"
+    }).execute()
+    
+    return {
+        "status": "success",
+        "should_advance": should_advance,
+        "next_stage_name": next_stage_name,
+        "next_stage_approver_emails": next_stage_approver_emails
+    }
+
+@app.post("/api/v1/approvals/pipelines/{id}/reject")
+async def reject_pipeline_stage(
+    id: str,
+    payload: PipelineRejectInput,
+    user_id: Optional[str] = Depends(get_current_user_id),
+    x_user_email: Optional[str] = Header(None, alias="x-user-email")
+):
+    db = get_admin_supabase_client()
+    clean_id = deobfuscate_id(id)
+    pipe_res = db.table("approval_pipelines").select("*, approval_stages(*)").eq("id", clean_id).execute()
+    if not pipe_res.data:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+        
+    pipeline = pipe_res.data[0]
+    stages = sorted(pipeline.get("approval_stages") or [], key=lambda s: s["stage_index"])
+    curr_idx = pipeline["current_stage_index"]
+    current_stage = stages[curr_idx] if curr_idx < len(stages) else None
+    stage_id = current_stage["id"] if current_stage else None
+    
+    if stage_id and not user_can_approve_stage(db, stage_id, user_id, x_user_email):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Forbidden: You are not authorized to reject Stage {curr_idx + 1} of this workflow."
+        )
+        
+    # Store Rejection Checklist
+    db.table("approval_rejection_checklists").insert({
+        "pipeline_id": clean_id,
+        "stage_id": stage_id,
+        "rejected_by": user_id if user_id and not user_id.startswith("user_") else None,
+        "reasons": payload.reasons,
+        "highlighted_fields": payload.highlighted_fields,
+        "feedback_notes": payload.feedback_notes
+    }).execute()
+    
+    # Revert pipeline status to Stage 1 Draft for revision
+    db.table("approval_pipelines").update({
+        "status": "rejected",
+        "current_stage_index": 0
+    }).eq("id", clean_id).execute()
+    
+    if stage_id:
+        db.table("approval_stages").update({"status": "rejected"}).eq("id", stage_id).execute()
+        
+    creator_email = None
+    if pipeline.get("created_by"):
+        c_res = db.table("members").select("email").eq("id", pipeline["created_by"]).execute()
+        if c_res.data and c_res.data[0].get("email"):
+            creator_email = c_res.data[0]["email"]
+            
+    # Audit Log
+    db.table("approval_logs").insert({
+        "pipeline_id": clean_id,
+        "stage_id": stage_id,
+        "actor_id": user_id if user_id and not user_id.startswith("user_") else None,
+        "action": "stage_rejected",
+        "notes": payload.feedback_notes or "Pipeline rejected"
+    }).execute()
+    
+    return {
+        "status": "success",
+        "message": "Pipeline rejected and reverted to Stage 1 Draft with checklist feedback.",
+        "creator_email": creator_email
+    }
+
+def user_can_manage_pipelines(db: Client, user_id: Optional[str], user_email: Optional[str], pipeline_creator_id: Optional[str] = None) -> bool:
+    clean_email = user_email.strip().lower() if user_email else None
+    
+    if user_id and not user_id.startswith("user_"):
+        m_res = db.table("members").select("is_primary_admin, id").eq("id", user_id).execute()
+        if m_res.data and m_res.data[0].get("is_primary_admin"):
+            return True
+                
+    if clean_email:
+        m_res = db.table("members").select("is_primary_admin, id").ilike("email", clean_email).execute()
+        if m_res.data and m_res.data[0].get("is_primary_admin"):
+            return True
+
+    user_role_ids = set()
+    if clean_email:
+        m_res = db.table("members").select("id").ilike("email", clean_email).execute()
+        if m_res.data:
+            mem = m_res.data[0]
+            mr_res = db.table("member_roles").select("role_id").eq("member_id", mem["id"]).execute()
+            for mr in (mr_res.data or []):
+                if mr.get("role_id"):
+                    user_role_ids.add(mr["role_id"])
+
+    if user_id and not user_id.startswith("user_"):
+        mr_res = db.table("member_roles").select("role_id").eq("member_id", user_id).execute()
+        for mr in (mr_res.data or []):
+            if mr.get("role_id"):
+                user_role_ids.add(mr["role_id"])
+        
+    for r_id in user_role_ids:
+        rp_res = db.table("role_permissions").select("*").eq("role_id", r_id).execute()
+        if rp_res.data:
+            rp = rp_res.data[0]
+            if rp.get("recruiter_pipelines") or rp.get("administrator"):
+                return True
+                
+    return False
+
+@app.delete("/api/v1/approvals/pipelines/{id}")
+async def delete_approval_pipeline(
+    id: str,
+    org_id: Optional[str] = Depends(get_user_org_id),
+    user_id: Optional[str] = Depends(get_current_user_id),
+    x_user_email: Optional[str] = Header(None, alias="x-user-email")
+):
+    db = get_admin_supabase_client()
+    clean_id = deobfuscate_id(id)
+    pipe_res = db.table("approval_pipelines").select("id, organization_id, created_by").eq("id", clean_id).execute()
+    if not pipe_res.data:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+        
+    pipeline = pipe_res.data[0]
+    if org_id and pipeline.get("organization_id") and pipeline["organization_id"] != org_id:
+        raise HTTPException(status_code=403, detail="Forbidden from deleting pipelines of another organization")
+        
+    if not user_can_manage_pipelines(db, user_id, x_user_email, pipeline.get("created_by")):
+        raise HTTPException(
+            status_code=403,
+            detail="Forbidden: Your role does not have permission to delete approval workflows."
+        )
+
+    # Get associated stage IDs
+    stg_res = db.table("approval_stages").select("id").eq("pipeline_id", clean_id).execute()
+    stage_ids = [s["id"] for s in (stg_res.data or []) if "id" in s]
+    
+    # Delete child relational records
+    if stage_ids:
+        for sid in stage_ids:
+            db.table("approval_stage_approvers").delete().eq("stage_id", sid).execute()
+    
+    db.table("approval_rejection_checklists").delete().eq("pipeline_id", clean_id).execute()
+    db.table("approval_logs").delete().eq("pipeline_id", clean_id).execute()
+    db.table("approval_stages").delete().eq("pipeline_id", clean_id).execute()
+    db.table("approval_pipelines").delete().eq("id", clean_id).execute()
+    
+    return {"status": "success", "message": "Approval pipeline deleted successfully"}
 
 
 # Simple index status check

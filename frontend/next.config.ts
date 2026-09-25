@@ -17,7 +17,7 @@ const nextConfig: NextConfig = {
     optimizePackageImports: ["lucide-react"],
   },
   async rewrites() {
-    const backendHost = process.env.BACKEND_URL || "http://localhost:8000";
+    const backendHost = process.env.BACKEND_INTERNAL_URL || process.env.BACKEND_URL || "http://localhost:8000";
     return [
       {
         source: "/api/v1/:path*",
