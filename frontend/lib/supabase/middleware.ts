@@ -6,8 +6,8 @@ export async function updateSession(request: NextRequest) {
     request,
   });
 
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL || "https://covhcpsyliesrgkjxhai.supabase.co";
-  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "sb_publishable_V69YOpwZKjrT1BT8k609nQ_MBzXV80b";
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL || "http://rpimu0p693wyvj4gqur3qvrt.88.222.213.242.sslip.io";
+  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzkwNjc1MjQwLCJleHAiOjE5NDgzNTUyNDB9._a4Lehy9CE3jFYdajzXfUNg3r8rYhtomzWam7U9U87I";
 
   const supabase = createServerClient(
     url,

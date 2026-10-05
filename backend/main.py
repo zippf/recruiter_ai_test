@@ -132,26 +132,18 @@ async def log_requests(request: Request, call_next):
     return response
 
 
-# Helper: Safe client creator to bypass validation for new publishable keys
+# Helper: Safe client creator
 def get_safe_supabase_client(url: str, key: str, jwt_token: str = None) -> Client:
-    dummy_jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.dummy.key"
     headers = {}
     if jwt_token:
         headers["Authorization"] = f"Bearer {jwt_token}"
     
     client = create_client(
         url, 
-        dummy_jwt, 
+        key, 
         options=ClientOptions(headers=headers)
     )
     
-    # Patch client properties with the real key
-    client.supabase_key = key
-    client.options.headers["apiKey"] = key
-    if not jwt_token:
-        client.options.headers["Authorization"] = f"Bearer {key}"
-        
-    # Patch GoTrue/Auth client headers if auth is used
     if hasattr(client, "auth") and client.auth:
         client.auth._headers["apiKey"] = key
         if jwt_token:
