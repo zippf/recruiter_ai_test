@@ -29,8 +29,8 @@ services:
     dns:
       - 8.8.8.8
       - 1.1.1.1
-    expose:
-      - "3000"
+    ports:
+      - "3000:3000"
     env_file:
       - .env
     restart: always
@@ -41,6 +41,9 @@ services:
     build:
       context: ./admin-console
       dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-https://covhcpsyliesrgkjxhai.supabase.co}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:-sb_publishable_V69YOpwZKjrT1BT8k609nQ_MBzXV80b}
     container_name: kozker_admin_console
     ports:
       - "3001:3000"
