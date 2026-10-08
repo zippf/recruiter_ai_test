@@ -49,7 +49,7 @@ export default function DashboardView({ onNavigate }: DashboardViewProps) {
   const { data: logs = [], isLoading: loadingLogs } = useQuery<ActivityLog[]>({
     queryKey: ["activity_log"],
     queryFn: () => apiRequest<ActivityLog[]>("GET", "/activity_log"),
-    refetchInterval: 3000
+    refetchInterval: 1500 // Refetch every 1.5s for real-time live log stream
   });
 
   const { data: applications = [], isLoading: loadingApplications } = useQuery<ExtendedApplication[]>({
@@ -166,7 +166,7 @@ export default function DashboardView({ onNavigate }: DashboardViewProps) {
   }, [jobs, candidates, logs, applications, expandedAppId]);
 
   // Calculate statistics based on fetched data
-  const activeJobsCount = jobs.filter(j => j.status === "published" || j.status === "confirmed").length;
+  const activeJobsCount = jobs.filter(j => j.status !== "closed" && !j.is_deleted).length;
   const totalCandidates = candidates.length;
   
   // Pending reviews: applications where screening_status is pending
@@ -588,9 +588,9 @@ export default function DashboardView({ onNavigate }: DashboardViewProps) {
                         </span>
                         <span 
                           onClick={() => onNavigate("jobs", job?.id)}
-                          className="text-xs font-semibold text-neutral-800 hover:text-primary cursor-pointer hover:underline"
+                          className="text-xs font-semibold text-neutral-800 hover:text-primary cursor-pointer hover:underline uppercase"
                         >
-                          {job?.title || "Unknown Opening"}
+                          {job?.title?.toUpperCase() || "UNKNOWN OPENING"}
                         </span>
                       </div>
                     </div>
